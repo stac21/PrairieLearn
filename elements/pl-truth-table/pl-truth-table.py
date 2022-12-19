@@ -4,6 +4,8 @@ import random
 import chevron
 import lxml.html
 import prairielearn as pl
+import python_helper_sympy as ph
+import ast
 
 WEIGHT_DEFAULT = 1
 FIXED_VARIABLES_ORDER_DEFAULT = False
@@ -21,10 +23,10 @@ def get_form_name(answers_name, index):
 
 def get_variable_names(element):
     variable_names = []
-    children = element[:]
 
-    for child in children:
-        if child.tag in ["pl-variable", "pl_variable"]:
+    for child in element:
+        if child.tag in ["pl-variable", "pl-variable"]:
+            pl.check_attribs(child, [], [])
             variable_names.append(pl.inner_html(child))
 
     return variable_names
@@ -32,10 +34,10 @@ def get_variable_names(element):
 
 def get_custom_rows(element):
     rows = []
-    children = element[:]
 
-    for child in children:
-        if child.tag in ["pl-row", "pl_row"]:
+    for child in element:
+        if child.tag in ["pl-row", "pl-row"]:
+            pl.check_attribs(child, [], [])
             rows.append(pl.inner_html(child))
 
     return rows
@@ -43,11 +45,13 @@ def get_custom_rows(element):
 
 def get_answer_columns(element):
     cols = []
-    children = element[:]
+    required_attribs = []
+    optional_attribs = ["expression"]
 
-    for child in children:
-        if child.tag in ["pl-answer-column", "pl_answer_column"]:
+    for child in element:
+        if child.tag in ["pl-answer-column", "pl-answer-column"]:
             expression = pl.get_string_attrib(child, "expression", None)
+            pl.check_attribs(child, required_attribs, optional_attribs)
 
             cols.append(
                 {
@@ -76,6 +80,42 @@ def build_expression(variables, expression):
     return new_expression
 
 
+def evaluate(expr, locals_for_eval = {}):
+
+    # Disallow escape character
+    if '\\' in expr:
+        raise ph.HasEscapeError(expr.find('\\'))
+
+    # Disallow comment character
+    if '#' in expr:
+        raise ph.HasCommentError(expr.find('#'))
+
+    # Parse (convert string to AST)
+    try:
+        root = ast.parse(expr, mode='eval')
+    except Exception as err:
+        raise ph.HasParseError(err.offset)
+
+    # Link each node to its parent
+    for node in ast.walk(root):
+        for child in ast.iter_child_nodes(node):
+            child.parent = node
+    
+    # Disallow AST nodes that are not in whitelist
+    whitelist = (ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq)
+    ph.CheckWhiteList(whitelist).visit(root)
+
+    # Clean up lineno and col_offset attributes (may not be necessary)
+    ast.fix_missing_locations(root)
+
+    # Convert AST to code and evaluate it with no global expressions and with
+    # a whitelist of local expressions
+    locals = {}
+    for key in locals_for_eval:
+        locals = {**locals, **locals_for_eval[key]}
+    return eval(compile(root, '<ast>', 'eval'), {'__builtins__': None}, locals)
+
+
 def prepare(element_html, data):
     element = lxml.html.fragment_fromstring(element_html)
 
@@ -91,6 +131,7 @@ def prepare(element_html, data):
         expressions.append(
             build_expression(variable_names, answer_columns[i]["expression"])
         )
+    locals_for_eval = {}
 
     num_vars = len(variable_names)
     default_num_rows = pow(2, num_vars)
@@ -147,7 +188,8 @@ def prepare(element_html, data):
                 keyed_row["values"] = values
                 display_rows.append(keyed_row)
                 for j in range(len(answer_columns)):
-                    correct_answers.append(str(bool(eval(expressions[j]))))
+                    locals_for_eval['variables'] = var_vals
+                    correct_answers.append(str(bool(evaluate(expressions[j], locals_for_eval))))
         else:
             used_indices = []
 
@@ -177,7 +219,8 @@ def prepare(element_html, data):
                     keyed_row["values"] = values
                     display_rows.append(keyed_row)
                     for j in range(len(answer_columns)):
-                        correct_answers.append(str(bool(eval(expressions[j]))))
+                        locals_for_eval['variables'] = var_vals
+                        correct_answers.append(str(bool(evaluate(expressions[j], locals_for_eval))))
     elif len(custom_rows) == 0:
         num_rows = default_num_rows
 
@@ -200,7 +243,8 @@ def prepare(element_html, data):
             keyed_row["values"] = values
             display_rows.append(keyed_row)
             for j in range(len(answer_columns)):
-                correct_answers.append(str(bool(eval(expressions[j]))))
+                locals_for_eval['variables'] = var_vals
+                correct_answers.append(str(bool(evaluate(expressions[j], locals_for_eval))))
     else:
         num_rows = len(custom_rows)
 
@@ -219,16 +263,23 @@ def prepare(element_html, data):
             keyed_row["values"] = values
             display_rows.append(keyed_row)
             for j in range(len(answer_columns)):
-                correct_answers.append(str(bool(eval(expressions[j]))))
+                locals_for_eval['variables'] = var_vals
+                correct_answers.append(str(bool(evaluate(expressions[j], locals_for_eval))))
 
-    data["params"][name] = (display_variables, display_rows, display_ans_columns)
+    data["params"][name] = {
+        "display_variables": display_variables,
+        "display_rows": display_rows,
+        "display_ans_columns": display_ans_columns
+    }
     data["correct_answers"][name] = correct_answers
 
 
 def parse(element_html, data):
     element = lxml.html.fragment_fromstring(element_html)
     name = pl.get_string_attrib(element, "answers-name")
-    display_variables, display_rows, display_ans_columns = data["params"].get(name)
+    display_variables = data["params"][name]["display_variables"]
+    display_rows = data["params"][name]["display_rows"]
+    display_ans_columns = data["params"][name]["display_ans_columns"]
     submitted_answers = data["submitted_answers"].get(name, [])
 
     for i in range(len(display_rows)):
@@ -253,7 +304,9 @@ def parse(element_html, data):
 def render(element_html, data):
     element = lxml.html.fragment_fromstring(element_html)
     name = pl.get_string_attrib(element, "answers-name")
-    display_variables, display_rows, display_ans_columns = data["params"].get(name)
+    display_variables = data["params"][name]["display_variables"]
+    display_rows = data["params"][name]["display_rows"]
+    display_ans_columns = data["params"][name]["display_ans_columns"]
     correct_answers = data["correct_answers"].get(name)
     num_ans_columns = len(display_ans_columns)
 
@@ -515,7 +568,9 @@ def grade(element_html, data):
     partial_credit = pl.get_boolean_attrib(
         element, "partial-credit", PARTIAL_CREDIT_DEFAULT
     )
-    display_variables, display_rows, display_ans_columns = data["params"][name]
+    display_variables = data["params"][name]["display_variables"]
+    display_rows = data["params"][name]["display_rows"]
+    display_ans_columns = data["params"][name]["display_ans_columns"]
 
     submitted_answers = data["submitted_answers"].get(name, [])
     correct_answers = data["correct_answers"].get(name, [])
